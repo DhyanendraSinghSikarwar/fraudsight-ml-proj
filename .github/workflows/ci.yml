@@ -1,0 +1,183 @@
+name: ci
+
+# lint -> types -> tests -> EVAL GATE -> security
+#
+# The eval gate is the point of this file. Lint and tests catch code that is
+# wrong; the gate catches code that is *worse* -- a prompt edit that drops
+# agreement, a policy change that lets ungrounded claims through. Those pass
+# every conventional check.
+#
+# Everything here runs with no vendor API key. The deterministic provider is a
+# real implementation of the LLM protocol, so the whole suite -- agent, judges,
+# gate, red team -- executes on a pull request from a fork. A gate that needs a
+# secret is a gate that gets skipped, and a skipped gate is not a gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PRIMARY_PROVIDER: deterministic
+  FALLBACK_PROVIDER: deterministic
+  VECTOR_BACKEND: local
+  FEATURE_BACKEND: local
+
+jobs:
+  static:
+    name: lint + types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src
+
+  artifacts:
+    name: build artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Compute artifact cache key
+        id: key
+        # Keyed on everything that changes the model or the corpus. A prompt
+        # edit must NOT bust this cache -- retraining on every prompt tweak
+        # would make the gate too slow to keep, and the model is unaffected.
+        run: |
+          echo "value=artifacts-$(git log -1 --format=%H -- \
+            src/fraudsight/features src/fraudsight/scoring src/fraudsight/data \
+            scripts/fetch_data.py)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            artifacts
+            data/processed
+            evals/datasets/triage_holdout.jsonl
+          key: ${{ steps.key.outputs.value }}
+
+      - name: Fetch data
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: uv run python scripts/fetch_data.py --dataset ieee
+
+      - name: Build everything the agent needs
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          uv run fraudsight features
+          uv run fraudsight train
+          uv run fraudsight thresholds
+          uv run fraudsight profiles
+          uv run fraudsight cases
+          uv run fraudsight evalset
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            artifacts
+            evals/datasets/triage_holdout.jsonl
+          retention-days: 7
+
+  test:
+    name: unit + security
+    runs-on: ubuntu-latest
+    needs: artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/unit tests/security -q --cov=src/fraudsight --cov-report=term-missing
+      - run: uv run pytest tests/integration -q -m integration
+
+  eval-gate:
+    name: EVAL GATE
+    runs-on: ubuntu-latest
+    needs: artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+      - run: uv sync --all-extras
+
+      - name: Calibrate the judge
+        # If the judge disagrees with the labelled set, the quality numbers
+        # below are unreliable and the gate fails on the instrument rather than
+        # reporting a measurement it cannot trust.
+        run: uv run fraudsight calibrate --build-reference
+
+      - name: Run the eval suite
+        # 3 repeats so run-to-run variance is measured. A 2% improvement next to
+        # a 3% spread is not an improvement.
+        run: uv run fraudsight eval --repeat 3 --floor
+
+      - name: Gate
+        run: uv run fraudsight gate --min-cases 100 --require-repeats 3
+
+      - name: Publish the report on the job summary
+        if: always()
+        run: |
+          {
+            echo '### Eval report'
+            echo '```json'
+            uv run python -c "import json;d=json.load(open('artifacts/eval_report.json'));print(json.dumps(d['metrics'],indent=2)[:4000])"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: |
+            artifacts/eval_report.json
+            artifacts/judge_calibration.json
+
+  redteam:
+    name: red team
+    runs-on: ubuntu-latest
+    needs: artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+      - run: uv sync --all-extras
+      - run: uv run fraudsight redteam
+      - name: Fail if any injection changed a decision
+        run: |
+          uv run python - <<'PY'
+          import json, sys
+          r = json.load(open("artifacts/redteam_report.json"))
+          failed = [x for x in r["results"] if not x["blocked"]]
+          print(f"{r['blocked']}/{r['attempts']} blocked ({r['pass_rate']:.0%})")
+          for f in failed:
+              print(f"UNBLOCKED [{f['category']}] {f['payload'][:80]}")
+          sys.exit(1 if failed else 0)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redteam-report
+          path: artifacts/redteam_report.json

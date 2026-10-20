@@ -1,0 +1,90 @@
+# Optional infrastructure. Nothing in the pipeline requires it: `make demo`,
+# `make eval` and the CI gate all run against local backends with no services.
+# This file is for the pgvector / Redis / Langfuse deployment path, and for
+# proving that the backends really are swappable behind a config flag.
+#
+# Bring it up with `make up`, then set in .env:
+#   VECTOR_BACKEND=pgvector
+#   FEATURE_BACKEND=redis
+#   LANGFUSE_PUBLIC_KEY=... LANGFUSE_SECRET_KEY=...
+
+name: fraudsight
+
+services:
+  postgres:
+    # pgvector on top of Postgres 16 rather than a dedicated vector database.
+    # At this corpus size a separate service would be an operational cost with
+    # no measurable retrieval benefit -- see docs/adr/0003.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: fraudsight
+      POSTGRES_PASSWORD: fraudsight
+      POSTGRES_DB: fraudsight
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraudsight -d fraudsight"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # appendonly so velocity windows survive a restart. Losing them is not
+    # fatal -- they rebuild from the stream -- but a cold window makes every
+    # card look new for an hour, which is a burst of false signals.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  langfuse-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfusedata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse:
+    image: langfuse/langfuse:2
+    depends_on:
+      langfuse-db: {condition: service_healthy}
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      # Local-only development secrets. Real deployments read these from the
+      # secret store; committing a working key would be the exact mistake
+      # config.py's SecretStr exists to prevent.
+      NEXTAUTH_SECRET: local-dev-only-not-a-real-secret
+      SALT: local-dev-only-not-a-real-salt
+      TELEMETRY_ENABLED: "false"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: fraudsight
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+
+volumes:
+  pgdata:
+  redisdata:
+  langfusedata:
+  grafanadata:

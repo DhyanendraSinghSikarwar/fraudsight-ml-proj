@@ -1,0 +1,55 @@
+# Secrets. The .env.example is committed; .env never is.
+.env
+.env.*
+!.env.example
+
+# Raw and derived data. ~1.2GB of CSV and ~40MB of parquet -- reproduced by
+# `make data && make features`, which is why they are not in git.
+data/raw/
+data/processed/
+
+# Trained artifacts and run outputs. Reproduced by `make artifacts`.
+artifacts/model.txt
+artifacts/calibrator.json
+artifacts/entity_stats.json
+artifacts/*.npy
+artifacts/scorer_metrics.json
+artifacts/thresholds.json
+artifacts/feature_summary.json
+artifacts/eval_report.json
+artifacts/judge_calibration.json
+artifacts/redteam_report.json
+artifacts/fairness_slices.json
+artifacts/cost_ledger.jsonl
+artifacts/analyst_decisions.jsonl
+artifacts/profiles/
+artifacts/cases/
+artifacts/traces/
+artifacts/reports/
+
+# The eval set IS committed -- it is the regression suite and it has to be
+# reviewable in a diff. Same for the labelling protocol and reference labels.
+!evals/datasets/*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
